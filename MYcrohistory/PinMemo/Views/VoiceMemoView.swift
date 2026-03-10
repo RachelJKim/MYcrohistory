@@ -13,9 +13,7 @@ struct VoiceMemoView: View {
             VStack(spacing: 24) {
                 ZStack(alignment: .topLeading) {
                     if editableText.isEmpty {
-                        Text(speechRecognizer.isModelLoading
-                             ? "Loading Whisper model (first run only)..."
-                             : "Tap the mic to start recording...")
+                        Text("Tap the mic to start recording...")
                             .foregroundStyle(.secondary)
                             .padding(12)
                     }
@@ -49,7 +47,6 @@ struct VoiceMemoView: View {
                             .foregroundStyle(.white)
                     }
                 }
-                .disabled(speechRecognizer.isModelLoading)
                 .padding(.bottom, 32)
             }
             .padding(.top)
@@ -69,9 +66,6 @@ struct VoiceMemoView: View {
             }
             .onChange(of: speechRecognizer.transcript) { _, newValue in
                 if speechRecognizer.isRecording { editableText = newValue }
-            }
-            .onChange(of: speechRecognizer.finalTranscript) { _, newValue in
-                if let final = newValue, !final.isEmpty { editableText = final }
             }
         }
     }

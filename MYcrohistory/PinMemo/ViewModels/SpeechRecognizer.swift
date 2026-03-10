@@ -2,48 +2,20 @@ import Foundation
 import Speech
 import AVFoundation
 import Observation
-import WhisperKit
 
 @Observable final class SpeechRecognizer {
     var transcript: String = ""
-    var finalTranscript: String? = nil
     var isRecording: Bool = false
-    var isModelLoading: Bool = false
     var errorMessage: String? = nil
 
-    private var whisperKit: WhisperKit?
-
-    // Apple STT — live partial display
-    private var appleRecognizer: SFSpeechRecognizer?
+    private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-
-    // Audio engine shared by both Apple STT and Whisper buffering
     private let audioEngine = AVAudioEngine()
-    private var audioConverter: AVAudioConverter?
-    private let whisperSampleRate: Double = 16000
-
-    // Whisper state
-    private var whisperSampleBuffer: [Float] = []   // current 5s window samples
-    private var committedText: String = ""           // Whisper-confirmed text
-    private var applePartial: String = ""            // Apple live partial
-    private var whisperTimer: Timer?
-    private let whisperInterval: TimeInterval = 5.0
+    private var previousText: String = ""
 
     init() {
-        appleRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ko-KR"))
-        Task { await loadModel() }
-    }
-
-    @MainActor
-    private func loadModel() async {
-        isModelLoading = true
-        do {
-            whisperKit = try await WhisperKit(model: "openai_whisper-small")
-        } catch {
-            errorMessage = "Model load failed: \(error.localizedDescription)"
-        }
-        isModelLoading = false
+        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ko-KR"))
     }
 
     // MARK: - Public
@@ -64,8 +36,7 @@ import WhisperKit
     func stopRecording() {
         guard isRecording else { return }
         isRecording = false
-        whisperTimer?.invalidate()
-        whisperTimer = nil
+        previousText = transcript
 
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
@@ -74,21 +45,14 @@ import WhisperKit
         recognitionTask?.cancel()
         recognitionTask = nil
         try? AVAudioSession.sharedInstance().setActive(false)
-
-        // Run Whisper on whatever's left in the buffer
-        let remaining = whisperSampleBuffer
-        whisperSampleBuffer = []
-        if !remaining.isEmpty {
-            Task { await runWhisper(on: remaining, isFinal: true) }
-        }
     }
 
     // MARK: - Session Setup
 
     private func beginSession() {
         // Fallback to English if Korean recognizer unavailable
-        if !(appleRecognizer?.isAvailable ?? false) {
-            appleRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        if !(speechRecognizer?.isAvailable ?? false) {
+            speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
         }
 
         let session = AVAudioSession.sharedInstance()
@@ -100,33 +64,37 @@ import WhisperKit
             return
         }
 
-        let inputNode = audioEngine.inputNode
-        let nativeFormat = inputNode.outputFormat(forBus: 0)
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        recognitionRequest?.shouldReportPartialResults = true
 
-        // Converter: native rate → 16kHz mono float for Whisper
-        if let whisperFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: whisperSampleRate,
-            channels: 1,
-            interleaved: false
-        ) {
-            audioConverter = AVAudioConverter(from: nativeFormat, to: whisperFormat)
+        guard let speechRecognizer, let recognitionRequest else {
+            errorMessage = "Speech recognizer unavailable"
+            return
         }
 
-        committedText = ""
-        applePartial = ""
-        whisperSampleBuffer = []
-        transcript = ""
-        finalTranscript = nil
-
-        startAppleSTT()
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             guard let self else { return }
-            // Feed to Apple STT
-            self.recognitionRequest?.append(buffer)
-            // Accumulate downsampled samples for Whisper
-            self.accumulateSamples(from: buffer, nativeFormat: nativeFormat)
+            if let result {
+                DispatchQueue.main.async {
+                    let current = result.bestTranscription.formattedString
+                    if self.previousText.isEmpty {
+                        self.transcript = current
+                    } else {
+                        self.transcript = self.previousText + " " + current
+                    }
+                }
+            }
+            if error != nil && self.isRecording {
+                DispatchQueue.main.async {
+                    self.errorMessage = error?.localizedDescription
+                }
+            }
+        }
+
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
         }
 
         audioEngine.prepare()
@@ -135,108 +103,6 @@ import WhisperKit
             isRecording = true
         } catch {
             errorMessage = "Audio engine failed: \(error.localizedDescription)"
-            return
         }
-
-        // Fire Whisper every 5 seconds
-        whisperTimer = Timer.scheduledTimer(withTimeInterval: whisperInterval, repeats: true) { [weak self] _ in
-            self?.flushToWhisper()
-        }
-    }
-
-    // MARK: - Apple STT
-
-    private func startAppleSTT() {
-        guard let appleRecognizer else { return }
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        recognitionRequest?.shouldReportPartialResults = true
-
-        recognitionTask = appleRecognizer.recognitionTask(with: recognitionRequest!) { [weak self] result, error in
-            guard let self else { return }
-            if let result {
-                let text = result.bestTranscription.formattedString
-                DispatchQueue.main.async {
-                    self.applePartial = text
-                    self.updateTranscript()
-                }
-            }
-            // Silently restart on isFinal or non-fatal error
-            if result?.isFinal == true || (error != nil && self.isRecording) {
-                DispatchQueue.main.async { self.resetAppleSTT() }
-            }
-        }
-    }
-
-    private func resetAppleSTT() {
-        recognitionRequest?.endAudio()
-        recognitionRequest = nil
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        applePartial = ""
-        if isRecording { startAppleSTT() }
-    }
-
-    // MARK: - Whisper
-
-    private func accumulateSamples(from buffer: AVAudioPCMBuffer, nativeFormat: AVAudioFormat) {
-        guard let converter = audioConverter,
-              let whisperFormat = converter.outputFormat as? AVAudioFormat else { return }
-
-        let ratio = whisperSampleRate / nativeFormat.sampleRate
-        let outCapacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio))
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: whisperFormat, frameCapacity: outCapacity) else { return }
-
-        var inputConsumed = false
-        converter.convert(to: outBuffer, error: nil) { _, status in
-            if inputConsumed { status.pointee = .noDataNow; return nil }
-            status.pointee = .haveData
-            inputConsumed = true
-            return buffer
-        }
-
-        if let data = outBuffer.floatChannelData?[0] {
-            let samples = Array(UnsafeBufferPointer(start: data, count: Int(outBuffer.frameLength)))
-            whisperSampleBuffer.append(contentsOf: samples)
-        }
-    }
-
-    private func flushToWhisper() {
-        guard !whisperSampleBuffer.isEmpty else { return }
-        let samples = whisperSampleBuffer
-        whisperSampleBuffer = []
-        resetAppleSTT()  // reset Apple window to match Whisper window
-        Task { await runWhisper(on: samples, isFinal: false) }
-    }
-
-    @MainActor
-    private func runWhisper(on samples: [Float], isFinal: Bool) async {
-        guard let whisperKit, samples.count > Int(whisperSampleRate * 0.5) else { return }
-        do {
-            let options = DecodingOptions(
-                task: .transcribe,
-                language: "ko",
-                temperature: 0.0,
-                temperatureFallbackCount: 3,
-                withoutTimestamps: true
-            )
-            let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options)
-            let text = results.map(\.text).joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            guard !text.isEmpty else { return }
-            let sep = committedText.isEmpty ? "" : " "
-            committedText += sep + text
-            if isFinal { applePartial = "" }
-            updateTranscript()
-            if isFinal { finalTranscript = transcript }
-        } catch {
-            // Silently ignore mid-session Whisper errors
-            if isFinal { errorMessage = error.localizedDescription }
-        }
-    }
-
-    private func updateTranscript() {
-        let sep = (committedText.isEmpty || applePartial.isEmpty) ? "" : " "
-        transcript = committedText + sep + applePartial
     }
 }
